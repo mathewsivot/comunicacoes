@@ -1,108 +1,168 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
-	"net"
+	"log"
+	"net/http"
 	"strings"
 
-	/*
-		"encoding/json"
-		"log"
-		"net/http"
-		"sync"
-	*/
 	"example.com/go/crypto/api"
+	"example.com/go/crypto/datatypes"
+	"example.com/go/crypto/protocol"
+	"github.com/gorilla/websocket"
 )
 
+const (
+	serverAddress        = ":3000"
+	websocketPath        = "/ws"
+	serverMaxMessageSize = int64(1024)
+)
+
+type rateFetcher func(currency string) (*datatypes.Rate, error)
+
+type socketServer struct {
+	upgrader websocket.Upgrader
+	getRate  rateFetcher
+}
+
+func newSocketServer(fetcher rateFetcher) *socketServer {
+	return &socketServer{
+		upgrader: websocket.Upgrader{
+			CheckOrigin: func(r *http.Request) bool { return true },
+		},
+		getRate: fetcher,
+	}
+}
+
 func main() {
-	ln, err := net.Listen("tcp", ":8080")
-	if err != nil {
-		fmt.Println("Falha ao iniciar servidor", err)
-		return
-	}
-	defer ln.Close()
-	fmt.Println("Servidor Socket aguardando conexao")
+	server := newSocketServer(api.GetRate)
 
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			fmt.Println("Erro ao aceitar conexao", err)
-			continue
-		}
+	http.HandleFunc(websocketPath, server.handleWebSocket)
 
-		go handleClient(conn)
-	}
+	fmt.Printf("Servidor WebSocket aguardando conexoes em %s%s\n", serverAddress, websocketPath)
+	log.Fatal(http.ListenAndServe(serverAddress, nil))
 }
 
-func handleClient(conn net.Conn) {
+func (s *socketServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := s.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("erro no upgrade websocket: %v", err)
+		return
+	}
 	defer conn.Close()
-	reader := bufio.NewReader(conn)
 
-	message, _ := reader.ReadString('\n')
-	if strings.TrimSpace(message) != "HELLO" {
-		conn.Write([]byte("Erro: failed handshake"))
+	conn.SetReadLimit(serverMaxMessageSize)
+
+	handshake, ok := s.readHandshake(conn)
+	if !ok {
 		return
 	}
-	conn.Write([]byte("READY\n"))
 
-	currency, _ := reader.ReadString('\n')
-	currency = strings.TrimSpace(currency)
+	effectiveMaxSize := minInt64(handshake.MaxMessageSize, serverMaxMessageSize)
+	conn.SetReadLimit(effectiveMaxSize)
 
-	rate, err := api.GetRate(currency)
+	if err := s.writeJSON(conn, protocol.HandshakeResponse{
+		Type:           protocol.MessageTypeHandshakeResponse,
+		Status:         protocol.HandshakeStatusAccepted,
+		OperationMode:  handshake.OperationMode,
+		MaxMessageSize: effectiveMaxSize,
+	}); err != nil {
+		log.Printf("erro ao enviar handshake response: %v", err)
+		return
+	}
+
+	log.Printf(
+		"handshake confirmado: conexao estabelecida com %s | modo=%s | max_message_size=%d",
+		conn.RemoteAddr(),
+		handshake.OperationMode,
+		effectiveMaxSize,
+	)
+
+	request, ok := s.readRateRequest(conn)
+	if !ok {
+		return
+	}
+
+	rate, err := s.getRate(request.Currency)
 	if err != nil {
-		conn.Write([]byte("Erro: Moeda nao encontrada"))
+		_ = s.writeJSON(conn, protocol.RateResponse{
+			Type:  protocol.MessageTypeRateResponse,
+			Error: "Erro: Moeda nao encontrada",
+		})
 		return
 	}
-	response := fmt.Sprintf("Currency:%s | Price:%.2f\n", rate.Currency, rate.Price)
-	conn.Write([]byte(response))
-}
 
-// API format, testing serve of parsed data  -- delete/useless
-
-/* func main() {
-	http.HandleFunc("/currency", currencyHandler)
-
-	fmt.Println("Server starting on port 8080")
-
-	log.Fatal(http.ListenAndServe(":8080", nil))
-}
-
-func currencyHandler(w http.ResponseWriter, r *http.Request) {
-	currencyCode := r.URL.Query().Get("code")
-
-	if currencyCode == "" {
-		http.Error(w, "no code guiven", http.StatusBadRequest)
-		return
-	}
-	rate, err := api.GetRate(strings.ToUpper(currencyCode))
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Data Fetch Error: %v", err), http.StatusInternalServerError)
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(rate)
-}
-*/
-
-// ROLLBACK TO THIS !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-/*func main() {
-	currencies := []string{"BTC", "ETH", "BCH", "ADA"}
-	var wg sync.WaitGroup
-	for _, currency := range currencies {
-		wg.Add(1)
-		go func(currencyCode string) {
-			getCurrencyData(currencyCode)
-			wg.Done()
-		}(currency)
-
-	}
-	wg.Wait()
-}
-
-func getCurrencyData(currency string) {
-	rates, err := api.GetRate(currency)
-	if err == nil {
-		fmt.Printf("%v : %v \n", rates.Currency, rates.Price)
+	if err := s.writeJSON(conn, protocol.RateResponse{
+		Type:     protocol.MessageTypeRateResponse,
+		Currency: rate.Currency,
+		Price:    rate.Price,
+	}); err != nil {
+		log.Printf("erro ao enviar rate response: %v", err)
 	}
 }
-*/
+
+func (s *socketServer) readHandshake(conn *websocket.Conn) (protocol.HandshakeRequest, bool) {
+	var request protocol.HandshakeRequest
+	if err := conn.ReadJSON(&request); err != nil {
+		s.writeProtocolError(conn, "Erro: handshake invalido")
+		return protocol.HandshakeRequest{}, false
+	}
+
+	switch {
+	case request.Type != protocol.MessageTypeHandshakeRequest:
+		s.writeProtocolError(conn, "Erro: primeira mensagem deve ser handshake_request")
+		return protocol.HandshakeRequest{}, false
+	case !isSupportedOperationMode(request.OperationMode):
+		s.writeProtocolError(conn, "Erro: modo de operacao nao suportado")
+		return protocol.HandshakeRequest{}, false
+	case request.MaxMessageSize <= 0:
+		s.writeProtocolError(conn, "Erro: tamanho maximo invalido")
+		return protocol.HandshakeRequest{}, false
+	default:
+		return request, true
+	}
+}
+
+func isSupportedOperationMode(mode string) bool {
+	return mode == protocol.OperationModeGoBackN || mode == protocol.OperationModeSelectiveRepeat
+}
+
+func (s *socketServer) readRateRequest(conn *websocket.Conn) (protocol.RateRequest, bool) {
+	var request protocol.RateRequest
+	if err := conn.ReadJSON(&request); err != nil {
+		s.writeProtocolError(conn, "Erro: requisicao invalida")
+		return protocol.RateRequest{}, false
+	}
+
+	if request.Type != protocol.MessageTypeRateRequest {
+		s.writeProtocolError(conn, "Erro: mensagem esperada rate_request")
+		return protocol.RateRequest{}, false
+	}
+
+	request.Currency = strings.TrimSpace(request.Currency)
+	if request.Currency == "" {
+		s.writeProtocolError(conn, "Erro: moeda obrigatoria")
+		return protocol.RateRequest{}, false
+	}
+
+	return request, true
+}
+
+func (s *socketServer) writeProtocolError(conn *websocket.Conn, message string) {
+	_ = s.writeJSON(conn, protocol.ErrorResponse{
+		Type:  protocol.MessageTypeError,
+		Error: message,
+	})
+	_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, message))
+}
+
+func (s *socketServer) writeJSON(conn *websocket.Conn, payload any) error {
+	return conn.WriteJSON(payload)
+}
+
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
