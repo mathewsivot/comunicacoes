@@ -15,6 +15,7 @@ import (
 const (
 	serverAddress        = ":3000"
 	websocketPath        = "/ws"
+	minMessageSize       = int64(30)
 	serverMaxMessageSize = int64(1024)
 )
 
@@ -115,7 +116,7 @@ func (s *socketServer) readHandshake(conn *websocket.Conn) (protocol.HandshakeRe
 	case !isSupportedOperationMode(request.OperationMode):
 		s.writeProtocolError(conn, "Erro: modo de operacao nao suportado")
 		return protocol.HandshakeRequest{}, false
-	case request.MaxMessageSize <= 0:
+	case request.MaxMessageSize < minMessageSize:
 		s.writeProtocolError(conn, "Erro: tamanho maximo invalido")
 		return protocol.HandshakeRequest{}, false
 	default:

@@ -10,7 +10,7 @@
   go run .
 ```
 
-O servidor expõe o endpoint `ws://localhost:8080/ws` e exige um handshake JSON inicial com:
+O servidor expõe o endpoint `ws://localhost:3000/ws` e exige um handshake JSON inicial com:
 
 - `operation_mode`
 - `max_message_size`

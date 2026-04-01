@@ -11,16 +11,17 @@ A parte principal da aplicacao esta na comunicacao entre cliente e servidor usan
 
 ## Arquitetura Geral
 
-O servidor sobe um endpoint HTTP em `:8080` e expoe o caminho WebSocket `ws://localhost:8080/ws`.
+O servidor sobe um endpoint HTTP em `:3000` e expoe o caminho WebSocket `ws://localhost:3000/ws`.
 
 O cliente:
 
 1. pede ao usuario o modo de operacao;
-2. abre uma conexao WebSocket com o servidor;
-3. envia um handshake em JSON;
-4. aguarda a confirmacao do servidor;
-5. envia a requisicao da moeda;
-6. recebe a resposta final e exibe no terminal.
+2. pede ao usuario o `max_message_size` desejado;
+3. abre uma conexao WebSocket com o servidor;
+4. envia um handshake em JSON;
+5. aguarda a confirmacao do servidor;
+6. envia a requisicao da moeda;
+7. recebe a resposta final e exibe no terminal.
 
 O servidor:
 
@@ -63,6 +64,9 @@ Antes de se conectar, o cliente pede que o usuario escolha um modo de operacao:
 
 No estado atual do projeto, esse modo faz parte da negociacao da sessao. Ou seja, ele e validado e confirmado no handshake, mesmo que ainda nao altere a logica de retransmissao internamente.
 
+Em seguida, o cliente tambem pede o `max_message_size` da sessao. Esse valor passa a ser definido pelo proprio usuario no terminal antes da abertura da conexao.
+O valor minimo aceito e `30`, enquanto o limite maximo continua sendo controlado pelo teto interno do servidor.
+
 ### 3. Handshake inicial
 
 Assim que a conexao WebSocket e aberta, o cliente envia a primeira mensagem da sessao:
@@ -78,7 +82,12 @@ Assim que a conexao WebSocket e aberta, o cliente envia a primeira mensagem da s
 Essa mensagem define dois pontos obrigatorios da conexao:
 
 - `operation_mode`: modo escolhido pelo cliente, aceitando `gbn` ou `sr`;
-- `max_message_size`: tamanho maximo de mensagem que o cliente deseja usar.
+- `max_message_size`: tamanho maximo de mensagem que o cliente deseja usar, agora escolhido pelo usuario no terminal.
+
+Regra atual do tamanho:
+
+- minimo permitido no cliente e no servidor: `30`
+- maximo efetivo da sessao: menor valor entre o pedido do cliente e o teto interno do servidor
 
 ### 4. Validacao do handshake no servidor
 
@@ -175,23 +184,24 @@ Essas validacoes impedem que o cliente entre na fase principal da sessao sem ant
 ### Servidor
 
 ```bash
-cd /home/mathews/frontendMasters/crypto/Server
+cd Server
 go run .
 ```
 
 ### Cliente
 
 ```bash
-cd /home/mathews/frontendMasters/crypto/Client
+cd Client
 go run .
 ```
 
 Fluxo esperado no cliente:
 
 1. escolher `gbn` ou `sr`;
-2. aguardar a confirmacao do handshake;
-3. informar a moeda;
-4. receber a resposta.
+2. informar o `max_message_size`;
+3. aguardar a confirmacao do handshake;
+4. informar a moeda;
+5. receber a resposta.
 
 Fluxo esperado no servidor:
 
