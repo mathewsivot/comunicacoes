@@ -40,11 +40,17 @@ func main() {
 
 	http.HandleFunc(websocketPath, server.handleWebSocket)
 
-	fmt.Printf("Servidor WebSocket aguardando conexoes em %s%s\n", serverAddress, websocketPath)
+	fmt.Printf(
+		"Servidor WebSocket aguardando conexoes em %s%s\n",
+		serverAddress,
+		websocketPath,
+	)
+
 	log.Fatal(http.ListenAndServe(serverAddress, nil))
 }
 
 func (s *socketServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("erro no upgrade websocket: %v", err)
@@ -59,51 +65,63 @@ func (s *socketServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	effectiveMaxSize := minInt64(handshake.MaxMessageSize, serverMaxMessageSize)
+	effectiveMaxSize := minInt64(
+		handshake.MaxMessageSize,
+		serverMaxMessageSize,
+	)
+
 	conn.SetReadLimit(effectiveMaxSize)
 
-	if err := s.writeJSON(conn, protocol.HandshakeResponse{
+	err = s.writeJSON(conn, protocol.HandshakeResponse{
 		Type:           protocol.MessageTypeHandshakeResponse,
 		Status:         protocol.HandshakeStatusAccepted,
 		OperationMode:  handshake.OperationMode,
 		MaxMessageSize: effectiveMaxSize,
-	}); err != nil {
+	})
+	if err != nil {
 		log.Printf("erro ao enviar handshake response: %v", err)
 		return
 	}
 
 	log.Printf(
-		"handshake confirmado: conexao estabelecida com %s | modo=%s | max_message_size=%d",
+		"handshake confirmado: conexao com %s | modo=%s | max_message_size=%d",
 		conn.RemoteAddr(),
 		handshake.OperationMode,
 		effectiveMaxSize,
 	)
+	for {
 
-	request, ok := s.readRateRequest(conn)
-	if !ok {
-		return
-	}
+		request, ok := s.readRateRequest(conn)
+		if !ok {
+			log.Printf("cliente desconectado: %s", conn.RemoteAddr())
+			return
+		}
 
-	rate, err := s.getRate(request.Currency)
-	if err != nil {
-		_ = s.writeJSON(conn, protocol.RateResponse{
-			Type:  protocol.MessageTypeRateResponse,
-			Error: "Erro: Moeda nao encontrada",
+		rate, err := s.getRate(request.Currency)
+		if err != nil {
+			_ = s.writeJSON(conn, protocol.RateResponse{
+				Type:  protocol.MessageTypeRateResponse,
+				Error: "Erro: Moeda nao encontrada",
+			})
+			continue
+		}
+
+		err = s.writeJSON(conn, protocol.RateResponse{
+			Type:     protocol.MessageTypeRateResponse,
+			Currency: rate.Currency,
+			Price:    rate.Price,
 		})
-		return
-	}
 
-	if err := s.writeJSON(conn, protocol.RateResponse{
-		Type:     protocol.MessageTypeRateResponse,
-		Currency: rate.Currency,
-		Price:    rate.Price,
-	}); err != nil {
-		log.Printf("erro ao enviar rate response: %v", err)
+		if err != nil {
+			log.Printf("erro ao enviar rate response: %v", err)
+			return
+		}
 	}
 }
-
 func (s *socketServer) readHandshake(conn *websocket.Conn) (protocol.HandshakeRequest, bool) {
+
 	var request protocol.HandshakeRequest
+
 	if err := conn.ReadJSON(&request); err != nil {
 		s.writeProtocolError(conn, "Erro: handshake invalido")
 		return protocol.HandshakeRequest{}, false
@@ -113,23 +131,27 @@ func (s *socketServer) readHandshake(conn *websocket.Conn) (protocol.HandshakeRe
 	case request.Type != protocol.MessageTypeHandshakeRequest:
 		s.writeProtocolError(conn, "Erro: primeira mensagem deve ser handshake_request")
 		return protocol.HandshakeRequest{}, false
+
 	case !isSupportedOperationMode(request.OperationMode):
 		s.writeProtocolError(conn, "Erro: modo de operacao nao suportado")
 		return protocol.HandshakeRequest{}, false
+
 	case request.MaxMessageSize < minMessageSize:
 		s.writeProtocolError(conn, "Erro: tamanho maximo invalido")
 		return protocol.HandshakeRequest{}, false
-	default:
-		return request, true
 	}
+
+	return request, true
 }
 
 func isSupportedOperationMode(mode string) bool {
-	return mode == protocol.OperationModeGoBackN || mode == protocol.OperationModeSelectiveRepeat
+	return mode == protocol.OperationModeGoBackN ||
+		mode == protocol.OperationModeSelectiveRepeat
 }
-
 func (s *socketServer) readRateRequest(conn *websocket.Conn) (protocol.RateRequest, bool) {
+
 	var request protocol.RateRequest
+
 	if err := conn.ReadJSON(&request); err != nil {
 		s.writeProtocolError(conn, "Erro: requisicao invalida")
 		return protocol.RateRequest{}, false
@@ -141,6 +163,7 @@ func (s *socketServer) readRateRequest(conn *websocket.Conn) (protocol.RateReque
 	}
 
 	request.Currency = strings.TrimSpace(request.Currency)
+
 	if request.Currency == "" {
 		s.writeProtocolError(conn, "Erro: moeda obrigatoria")
 		return protocol.RateRequest{}, false
@@ -148,13 +171,17 @@ func (s *socketServer) readRateRequest(conn *websocket.Conn) (protocol.RateReque
 
 	return request, true
 }
-
 func (s *socketServer) writeProtocolError(conn *websocket.Conn, message string) {
+
 	_ = s.writeJSON(conn, protocol.ErrorResponse{
 		Type:  protocol.MessageTypeError,
 		Error: message,
 	})
-	_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, message))
+
+	_ = conn.WriteMessage(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.ClosePolicyViolation, message),
+	)
 }
 
 func (s *socketServer) writeJSON(conn *websocket.Conn, payload any) error {
