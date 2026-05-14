@@ -1,196 +1,221 @@
 package main
 
 import (
+	"encoding/hex"
 	"fmt"
-	"log"
-	"net/http"
+	"net"
+	"strconv"
 	"strings"
-
-	"example.com/go/crypto/api"
-	"example.com/go/crypto/datatypes"
-	"example.com/go/crypto/protocol"
-	"github.com/gorilla/websocket"
+	"time"
 )
 
-const (
-	serverAddress        = ":3000"
-	websocketPath        = "/ws"
-	minMessageSize       = int64(30)
-	serverMaxMessageSize = int64(1024)
-)
+var MANUAL_KEY = []byte("COMP")
 
-type rateFetcher func(currency string) (*datatypes.Rate, error)
+const windowSize = 5
 
-type socketServer struct {
-	upgrader websocket.Upgrader
-	getRate  rateFetcher
+type ClientState struct {
+	total       int
+	received    map[int]string
+	expectedSeq int
+	modo        string
 }
 
-func newSocketServer(fetcher rateFetcher) *socketServer {
-	return &socketServer{
-		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool { return true },
-		},
-		getRate: fetcher,
+func checksum(s string) int {
+	sum := 0
+	for _, c := range s {
+		sum += int(c)
 	}
+	return sum % 256
+}
+
+func manualDecrypt(encryptedHex string) (string, error) {
+
+	encryptedBytes, err := hex.DecodeString(encryptedHex)
+	if err != nil {
+		return "", err
+	}
+	if len(encryptedBytes) != 4 {
+		return "", fmt.Errorf("payload criptografado deve ter 4 bytes")
+	}
+
+	decryptedSub := make([]byte, 4)
+
+	decryptedSub[0] = encryptedBytes[2]
+	decryptedSub[1] = encryptedBytes[3]
+	decryptedSub[2] = encryptedBytes[0]
+	decryptedSub[3] = encryptedBytes[1]
+
+	original := make([]byte, 4)
+
+	for i := 0; i < 4; i++ {
+		original[i] = decryptedSub[i] ^ MANUAL_KEY[i]
+	}
+
+	return string(original), nil
 }
 
 func main() {
-	server := newSocketServer(api.GetRate)
 
-	http.HandleFunc(websocketPath, server.handleWebSocket)
+	addr, _ := net.ResolveUDPAddr("udp", ":10000")
+	conn, _ := net.ListenUDP("udp", addr)
 
-	fmt.Printf(
-		"Servidor WebSocket aguardando conexoes em %s%s\n",
-		serverAddress,
-		websocketPath,
-	)
+	fmt.Println("[SERVIDOR] ouvindo em 0.0.0.0:10000")
 
-	log.Fatal(http.ListenAndServe(serverAddress, nil))
-}
+	clients := make(map[string]*ClientState)
 
-func (s *socketServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	buffer := make([]byte, 4096)
 
-	conn, err := s.upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("erro no upgrade websocket: %v", err)
-		return
-	}
-	defer conn.Close()
-
-	conn.SetReadLimit(serverMaxMessageSize)
-
-	handshake, ok := s.readHandshake(conn)
-	if !ok {
-		return
-	}
-
-	effectiveMaxSize := minInt64(
-		handshake.MaxMessageSize,
-		serverMaxMessageSize,
-	)
-
-	conn.SetReadLimit(effectiveMaxSize)
-
-	err = s.writeJSON(conn, protocol.HandshakeResponse{
-		Type:           protocol.MessageTypeHandshakeResponse,
-		Status:         protocol.HandshakeStatusAccepted,
-		OperationMode:  handshake.OperationMode,
-		MaxMessageSize: effectiveMaxSize,
-	})
-	if err != nil {
-		log.Printf("erro ao enviar handshake response: %v", err)
-		return
-	}
-
-	log.Printf(
-		"handshake confirmado: conexao com %s | modo=%s | max_message_size=%d",
-		conn.RemoteAddr(),
-		handshake.OperationMode,
-		effectiveMaxSize,
-	)
 	for {
 
-		request, ok := s.readRateRequest(conn)
-		if !ok {
-			log.Printf("cliente desconectado: %s", conn.RemoteAddr())
-			return
+		n, clientAddr, _ := conn.ReadFromUDP(buffer)
+
+		arrival := time.Now().Format("15:04:05")
+		msg := string(buffer[:n])
+		parts := strings.Split(msg, "|")
+
+		key := clientAddr.String()
+
+		switch parts[0] {
+
+		case "HELLO":
+			if len(parts) < 3 {
+				conn.WriteToUDP([]byte("NAK|0"), clientAddr)
+				continue
+			}
+
+			maxlen := parts[1]
+			modo := parts[2]
+
+			fmt.Printf("[%s] HELLO %s MAXLEN=%s MODO=%s\n",
+				arrival, key, maxlen, modo)
+
+			conn.WriteToUDP(
+				[]byte(fmt.Sprintf("HELLO_ACK|%d", windowSize)),
+				clientAddr,
+			)
+
+			clients[key] = &ClientState{
+				total:       -1,
+				received:    map[int]string{},
+				expectedSeq: 0,
+				modo:        modo,
+			}
+
+		case "DATA":
+
+			if len(parts) < 5 {
+				conn.WriteToUDP([]byte("NAK|0"), clientAddr)
+				continue
+			}
+
+			seq, err := strconv.Atoi(parts[1])
+			if err != nil {
+				conn.WriteToUDP([]byte("NAK|0"), clientAddr)
+				continue
+			}
+
+			total, err := strconv.Atoi(parts[2])
+			if err != nil || total <= 0 {
+				conn.WriteToUDP([]byte(fmt.Sprintf("NAK|%d", seq)), clientAddr)
+				continue
+			}
+
+			payloadEnc := parts[3]
+			recvCS, err := strconv.Atoi(parts[4])
+			if err != nil {
+				conn.WriteToUDP([]byte(fmt.Sprintf("NAK|%d", seq)), clientAddr)
+				continue
+			}
+
+			state := clients[key]
+			if state == nil {
+				fmt.Printf("[%s] DATA rejeitado de %s: HELLO nao realizado\n", arrival, key)
+				conn.WriteToUDP([]byte("NAK|0"), clientAddr)
+				continue
+			}
+
+			payloadPad, err := manualDecrypt(payloadEnc)
+
+			if err != nil {
+				conn.WriteToUDP(
+					[]byte(fmt.Sprintf("NAK|%d", seq)),
+					clientAddr,
+				)
+				continue
+			}
+
+			if checksum(payloadPad) != recvCS {
+				fmt.Println("Erro checksum", seq)
+				conn.WriteToUDP(
+					[]byte(fmt.Sprintf("NAK|%d", seq)),
+					clientAddr,
+				)
+				continue
+			}
+
+			payload := strings.TrimRight(payloadPad, " ")
+
+			if state.total == -1 {
+				state.total = total
+			}
+
+			if state.modo == "gobackn" {
+
+				if seq == state.expectedSeq {
+
+					state.received[seq] = payload
+					state.expectedSeq++
+
+					conn.WriteToUDP(
+						[]byte(fmt.Sprintf("ACK|%d", seq)),
+						clientAddr,
+					)
+
+				} else if seq < state.expectedSeq {
+
+					conn.WriteToUDP(
+						[]byte(fmt.Sprintf("ACK|%d", seq)),
+						clientAddr,
+					)
+
+				} else {
+
+					conn.WriteToUDP(
+						[]byte(fmt.Sprintf("NAK|%d", state.expectedSeq)),
+						clientAddr,
+					)
+				}
+
+			} else { // Selective Repeat
+
+				state.received[seq] = payload
+
+				conn.WriteToUDP(
+					[]byte(fmt.Sprintf("ACK|%d", seq)),
+					clientAddr,
+				)
+			}
+
+			if len(state.received) == state.total {
+
+				full := ""
+
+				for i := 0; i < state.total; i++ {
+					full += state.received[i]
+				}
+
+				fmt.Println("================================")
+				fmt.Println("MENSAGEM COMPLETA:")
+				fmt.Println(full)
+				fmt.Println("================================")
+
+				clients[key] = &ClientState{
+					total:       -1,
+					received:    map[int]string{},
+					expectedSeq: 0,
+					modo:        state.modo,
+				}
+			}
 		}
-
-		rate, err := s.getRate(request.Currency)
-		if err != nil {
-			_ = s.writeJSON(conn, protocol.RateResponse{
-				Type:  protocol.MessageTypeRateResponse,
-				Error: "Erro: Moeda nao encontrada",
-			})
-			continue
-		}
-
-		err = s.writeJSON(conn, protocol.RateResponse{
-			Type:     protocol.MessageTypeRateResponse,
-			Currency: rate.Currency,
-			Price:    rate.Price,
-		})
-
-		if err != nil {
-			log.Printf("erro ao enviar rate response: %v", err)
-			return
-		}
 	}
-}
-func (s *socketServer) readHandshake(conn *websocket.Conn) (protocol.HandshakeRequest, bool) {
-
-	var request protocol.HandshakeRequest
-
-	if err := conn.ReadJSON(&request); err != nil {
-		s.writeProtocolError(conn, "Erro: handshake invalido")
-		return protocol.HandshakeRequest{}, false
-	}
-
-	switch {
-	case request.Type != protocol.MessageTypeHandshakeRequest:
-		s.writeProtocolError(conn, "Erro: primeira mensagem deve ser handshake_request")
-		return protocol.HandshakeRequest{}, false
-
-	case !isSupportedOperationMode(request.OperationMode):
-		s.writeProtocolError(conn, "Erro: modo de operacao nao suportado")
-		return protocol.HandshakeRequest{}, false
-
-	case request.MaxMessageSize < minMessageSize:
-		s.writeProtocolError(conn, "Erro: tamanho maximo invalido")
-		return protocol.HandshakeRequest{}, false
-	}
-
-	return request, true
-}
-
-func isSupportedOperationMode(mode string) bool {
-	return mode == protocol.OperationModeGoBackN ||
-		mode == protocol.OperationModeSelectiveRepeat
-}
-func (s *socketServer) readRateRequest(conn *websocket.Conn) (protocol.RateRequest, bool) {
-
-	var request protocol.RateRequest
-
-	if err := conn.ReadJSON(&request); err != nil {
-		s.writeProtocolError(conn, "Erro: requisicao invalida")
-		return protocol.RateRequest{}, false
-	}
-
-	if request.Type != protocol.MessageTypeRateRequest {
-		s.writeProtocolError(conn, "Erro: mensagem esperada rate_request")
-		return protocol.RateRequest{}, false
-	}
-
-	request.Currency = strings.TrimSpace(request.Currency)
-
-	if request.Currency == "" {
-		s.writeProtocolError(conn, "Erro: moeda obrigatoria")
-		return protocol.RateRequest{}, false
-	}
-
-	return request, true
-}
-func (s *socketServer) writeProtocolError(conn *websocket.Conn, message string) {
-
-	_ = s.writeJSON(conn, protocol.ErrorResponse{
-		Type:  protocol.MessageTypeError,
-		Error: message,
-	})
-
-	_ = conn.WriteMessage(
-		websocket.CloseMessage,
-		websocket.FormatCloseMessage(websocket.ClosePolicyViolation, message),
-	)
-}
-
-func (s *socketServer) writeJSON(conn *websocket.Conn, payload any) error {
-	return conn.WriteJSON(payload)
-}
-
-func minInt64(a, b int64) int64 {
-	if a < b {
-		return a
-	}
-	return b
 }

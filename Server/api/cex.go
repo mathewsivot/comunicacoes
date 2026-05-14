@@ -14,10 +14,15 @@ const apiURL = "https://cex.io/api/ticker/%s/USD"
 
 func GetRate(currency string) (*datatypes.Rate, error) {
 	upCurrency := strings.ToUpper(currency)
+	if upCurrency == "" {
+		return nil, fmt.Errorf("currency cannot be empty")
+	}
+
 	res, err := http.Get(fmt.Sprintf(apiURL, upCurrency))
 	if err != nil {
 		return nil, err
 	}
+	defer res.Body.Close()
 
 	var responseNew CEXResponse
 	if res.StatusCode == http.StatusOK {
