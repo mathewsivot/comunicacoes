@@ -134,7 +134,7 @@ func main() {
 		}
 
 		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-		n, _, err := conn.ReadFromUDP(buffer)
+		n, err := conn.Read(buffer)
 
 		if err != nil {
 			if modo == "gobackn" {
